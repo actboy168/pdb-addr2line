@@ -29,11 +29,9 @@ build\bin\pdb-addr2line.exe
 ## 用法
 
 ```text
-pdb-addr2line <pdb-path> <rva> [more-rva...]
-pdb-addr2line <pdb-path> --rva <rva> [more-rva...]
-pdb-addr2line <pdb-path> --va <virtual-address> [more-virtual-address...]
-pdb-addr2line <pdb-path> --image <binary-path> --va <virtual-address> [more-virtual-address...]
-pdb-addr2line <pdb-path> --image-base <hex> --va <virtual-address> [more-virtual-address...]
+pdb-addr2line <pdb-path> <address> [more-address...]
+pdb-addr2line <pdb-path> --image <binary-path> <virtual-address> [more-virtual-address...]
+pdb-addr2line <pdb-path> --image-base <hex> <virtual-address> [more-virtual-address...]
 ```
 
 ### 参数说明
@@ -41,17 +39,20 @@ pdb-addr2line <pdb-path> --image-base <hex> --va <virtual-address> [more-virtual
 | 参数 | 说明 |
 | --- | --- |
 | `<pdb-path>` | PDB 文件路径 |
-| `--rva` | 按相对虚拟地址查询 |
-| `--va` | 按虚拟地址查询 |
 | `--image <binary-path>` | 查询 VA 时，从 PE 文件读取 ImageBase |
 | `--image-base <hex>` | 查询 VA 时手动指定 ImageBase |
+
+地址类型按参数自动推断：
+
+- **不带** `--image` / `--image-base`：输入按 **RVA** 处理
+- **带了** `--image` 或 `--image-base`：输入按 **VA** 处理
 
 ## 示例
 
 ### 按 RVA 查询
 
 ```powershell
-build\bin\pdb-addr2line.exe foo.pdb --rva 0x18444aa
+build\bin\pdb-addr2line.exe foo.pdb 0x18444aa
 ```
 
 示例输出：
@@ -63,13 +64,13 @@ FMallocAnsi::Realloc at C:\project\src\hal\MallocAnsi.cpp:205
 ### 按 VA 查询
 
 ```powershell
-build\bin\pdb-addr2line.exe foo.pdb --image-base 0x140000000 --va 0x1418444aa
+build\bin\pdb-addr2line.exe foo.pdb --image-base 0x140000000 0x1418444aa
 ```
 
 ### 批量查询
 
 ```powershell
-build\bin\pdb-addr2line.exe foo.pdb --image-base 0x140000000 --va 0x1418444aa 0x1419052eb
+build\bin\pdb-addr2line.exe foo.pdb --image-base 0x140000000 0x1418444aa 0x1419052eb
 ```
 
 ## 输出格式
@@ -104,5 +105,5 @@ path:line
 
 - 当前面向 **Windows + PDB** 场景
 - 当前命令行接口支持 **RVA / VA** 查询
-- `--va` 需要提供 `--image` 或 `--image-base`
+- 只有在提供 `--image` 或 `--image-base` 时，输入才按 **VA** 处理
 - 不支持 `/DEBUG:FASTLINK` 生成的 PDB

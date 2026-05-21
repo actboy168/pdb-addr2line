@@ -12,11 +12,9 @@ namespace {
 std::string Usage() {
     return
         "Usage:\n"
-        "  pdb-addr2line <pdb-path> <rva> [more-rva...]\n"
-        "  pdb-addr2line <pdb-path> --rva <rva> [more-rva...]\n"
-        "  pdb-addr2line <pdb-path> --va <virtual-address> [more-virtual-address...]\n"
-        "  pdb-addr2line <pdb-path> --image <binary-path> --va <virtual-address> [more-virtual-address...]\n"
-        "  pdb-addr2line <pdb-path> --image-base <hex> --va <virtual-address> [more-virtual-address...]\n";
+        "  pdb-addr2line <pdb-path> <address> [more-address...]\n"
+        "  pdb-addr2line <pdb-path> --image <binary-path> <virtual-address> [more-virtual-address...]\n"
+        "  pdb-addr2line <pdb-path> --image-base <hex> <virtual-address> [more-virtual-address...]\n";
 }
 
 bool ParseCommandLine(int argc, char** argv, CommandLine& command_line, std::string& error) {
@@ -49,25 +47,6 @@ bool ParseCommandLine(int argc, char** argv, CommandLine& command_line, std::str
             continue;
         }
 
-        if (arg == "--rva" || arg == "--va") {
-            if (i + 1 >= argc) {
-                error = arg + " requires at least one value";
-                return false;
-            }
-
-            if (arg == "--rva") {
-                command_line.query_kind = QueryKind::Rva;
-            } else if (arg == "--va") {
-                command_line.query_kind = QueryKind::Va;
-            }
-
-            for (++i; i < argc; ++i) {
-                const std::string value_arg = argv[i];
-                command_line.query_values.emplace_back(value_arg);
-            }
-            break;
-        }
-
         if (!arg.empty() && arg[0] == '-') {
             error = "unknown option: " + arg;
             return false;
@@ -89,12 +68,11 @@ bool ParseCommandLine(int argc, char** argv, CommandLine& command_line, std::str
         error = "missing address input";
         return false;
     }
-    if (command_line.query_kind == QueryKind::Va &&
-        command_line.image_path.empty() &&
-        command_line.image_base_override == 0) {
-        error = "--va requires --image <binary-path> or --image-base <hex>";
-        return false;
-    }
+
+    command_line.query_kind =
+        (!command_line.image_path.empty() || command_line.image_base_override != 0)
+        ? QueryKind::Va
+        : QueryKind::Rva;
 
     return true;
 }
