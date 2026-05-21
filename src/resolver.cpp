@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string_view>
 #include <unordered_set>
 
 Resolver::Resolver() = default;
@@ -53,15 +54,15 @@ std::string ErrorCodeToString(PDB::ErrorCode code) {
     }
 }
 
-std::string TrimTrailingNul(std::string value) {
+std::string_view TrimTrailingNul(std::string_view value) {
     while (!value.empty() && value.back() == '\0') {
-        value.pop_back();
+        value.remove_suffix(1);
     }
     return value;
 }
 
-std::string ToString(PDB::ArrayView<char> view) {
-    return TrimTrailingNul(std::string(view.Decay(), view.GetLength()));
+std::string_view ToStringView(PDB::ArrayView<char> view) {
+    return TrimTrailingNul(std::string_view(view.Decay(), view.GetLength()));
 }
 
 std::uint8_t GetNumericLeafSize(PDB::CodeView::TPI::TypeRecordKind kind) {
@@ -222,8 +223,8 @@ void Resolver::ProcessModules(
     for (std::uint32_t module_index : modules_to_process) {
         const PDB::ModuleInfoStream::Module& module = module_info_stream.GetModule(module_index);
 
-        const std::uint32_t module_name_index = strings_.Intern(ToString(module.GetName()));
-        const std::uint32_t object_name_index = strings_.Intern(ToString(module.GetObjectName()));
+        const std::uint32_t module_name_index = strings_.Intern(ToStringView(module.GetName()));
+        const std::uint32_t object_name_index = strings_.Intern(ToStringView(module.GetObjectName()));
 
         std::unordered_map<std::uint32_t, InlineeSourceInfo> module_inlinee_sources;
         std::unordered_map<std::uint32_t, std::uint32_t> module_filename_offset_by_checksum_offset;
