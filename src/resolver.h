@@ -1,14 +1,13 @@
 #pragma once
 
 #include "types.h"
-#include "string_pool.h"
 #include "memory_mapped_file.h"
 #include "PDB_ImageSectionStream.h"
 #include "PDB_ModuleInfoStream.h"
 #include "PDB_NamesStream.h"
 
 #include <cstdint>
-#include <limits>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,7 +41,6 @@ public:
     const LineEntry* Find(std::uint32_t rva) const;
     const FunctionEntry* FindFunction(std::uint32_t rva) const;
     std::vector<InlineFrame> FindInlineFrames(std::uint32_t rva);
-    const std::string& GetString(std::uint32_t index) const;
 
 private:
     void ProcessModules(
@@ -67,18 +65,17 @@ private:
         std::unordered_map<std::uint32_t, std::size_t>& function_index_by_rva,
         std::uint32_t rva,
         std::uint32_t code_size,
-        std::uint32_t name_index);
+        const char* name);
 
     std::vector<std::uint32_t> FindModuleIndicesForRva(std::uint32_t rva) const;
     bool EnsureIpiStream();
     bool EnsureTpiStream();
     void BuildTpiRecordOffsets();
-    std::optional<std::uint32_t> ResolveInlineeNameIndex(std::uint32_t inlinee_id);
-    std::optional<std::uint32_t> ResolveClassTypeNameIndex(std::uint32_t type_index);
+    const char* ResolveInlineeNameIndex(std::uint32_t inlinee_id);
+    const char* ResolveClassTypeNameIndex(std::uint32_t type_index);
     void ResolveInlineSiteName(InlineSiteEntry& site);
     void LoadPublicSymbols();
     bool TryLoadPublicFunction(std::uint32_t rva);
-    std::uint32_t GetUnknownInlineeNameIndex();
 
     MemoryMappedFile pdb_file_;
     const void* pdb_data_ = nullptr;
@@ -95,22 +92,20 @@ private:
     bool public_symbols_loaded_ = false;
     bool ipi_stream_checked_ = false;
     bool tpi_stream_checked_ = false;
-    std::uint32_t unknown_inlinee_name_index_ = std::numeric_limits<std::uint32_t>::max();
 
-    std::unordered_map<std::uint32_t, std::uint32_t> inlinee_name_index_by_id_;
-    std::unordered_map<std::uint32_t, std::uint32_t> class_type_name_index_by_id_;
+    std::unordered_map<std::uint32_t, const char*> inlinee_name_by_id_;
+    std::unordered_map<std::uint32_t, const char*> class_type_name_by_id_;
     std::unordered_set<std::uint32_t> missing_inlinee_ids_;
     std::unordered_set<std::uint32_t> missing_class_type_ids_;
     std::unordered_set<std::uint32_t> resolving_inlinee_ids_;
     std::unordered_set<std::uint32_t> loaded_module_indices_;
     std::vector<std::size_t> tpi_record_offsets_;
 
-    StringPool strings_;
+    std::deque<std::string> owned_strings_;
     std::vector<LineEntry> lines_;
     std::vector<FunctionEntry> functions_;
     std::vector<InlineSiteEntry> inline_sites_;
     std::unordered_map<std::uint32_t, std::vector<std::size_t>> inline_roots_by_function_rva_;
-    std::vector<std::size_t> pending_file_indices_;
 
     std::vector<std::pair<std::uint32_t, std::uint32_t>> contribution_rvas_;
     std::vector<std::uint16_t> contribution_modules_;

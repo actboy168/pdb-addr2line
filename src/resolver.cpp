@@ -27,8 +27,6 @@ Resolver::~Resolver() = default;
 
 namespace {
 
-constexpr std::uint32_t kInvalidStringIndex = std::numeric_limits<std::uint32_t>::max();
-
 std::string ErrorCodeToString(PDB::ErrorCode code) {
     switch (code) {
     case PDB::ErrorCode::Success:
@@ -95,12 +93,10 @@ const char* GetLeafName(const char* data, PDB::CodeView::TPI::TypeRecordKind kin
 }  // namespace
 
 void Resolver::ResetLoadedState() {
-    strings_.Clear();
     lines_.clear();
     functions_.clear();
     inline_sites_.clear();
     inline_roots_by_function_rva_.clear();
-    pending_file_indices_.clear();
     contribution_rvas_.clear();
     contribution_modules_.clear();
     loaded_module_indices_.clear();
@@ -109,8 +105,8 @@ void Resolver::ResetLoadedState() {
 }
 
 void Resolver::ResetTypeResolutionState() {
-    inlinee_name_index_by_id_.clear();
-    class_type_name_index_by_id_.clear();
+    inlinee_name_by_id_.clear();
+    class_type_name_by_id_.clear();
     missing_inlinee_ids_.clear();
     missing_class_type_ids_.clear();
     resolving_inlinee_ids_.clear();
@@ -118,7 +114,6 @@ void Resolver::ResetTypeResolutionState() {
     tpi_stream_.reset();
     ipi_stream_checked_ = false;
     tpi_stream_checked_ = false;
-    unknown_inlinee_name_index_ = kInvalidStringIndex;
     tpi_record_offsets_.clear();
 }
 
@@ -167,7 +162,6 @@ bool Resolver::Load(const std::string& pdb_path, std::string& error) {
     ResetLoadedState();
     ResetTypeResolutionState();
 
-    // Load section contributions for module filtering
     if (dbi_stream_->HasValidSectionContributionStream(*raw_file_) == PDB::ErrorCode::Success) {
         const PDB::SectionContributionStream scs = dbi_stream_->CreateSectionContributionStream(*raw_file_);
         const size_t contrib_count = scs.GetContributions().GetLength();
@@ -203,9 +197,13 @@ void Resolver::ProcessModules(
     const PDB::NamesStream& names_stream,
     const std::unordered_set<std::uint32_t>* module_filter,
     std::string& error) {
-    std::vector<PendingFilename> filenames;
+    struct PendingLineFile {
+        std::size_t line_index = 0;
+        std::uint32_t file_checksum_offset = 0;
+    };
+
     std::unordered_map<std::uint32_t, std::size_t> function_index_by_rva;
-    const std::size_t new_lines_start = lines_.size();
+    std::vector<PendingLineFile> pending_line_files;
 
     std::vector<std::uint32_t> modules_to_process;
     if (module_filter != nullptr) {
@@ -223,12 +221,12 @@ void Resolver::ProcessModules(
 
         std::unordered_map<std::uint32_t, InlineeSourceInfo> module_inlinee_sources;
         std::unordered_map<std::uint32_t, std::uint32_t> module_filename_offset_by_checksum_offset;
-        const auto resolve_module_source_index = [&](std::uint32_t file_checksum_offset) -> std::optional<std::uint32_t> {
+        const auto resolve_module_source_index = [&](std::uint32_t file_checksum_offset) -> const char* {
             const auto it = module_filename_offset_by_checksum_offset.find(file_checksum_offset);
             if (it == module_filename_offset_by_checksum_offset.end()) {
-                return std::nullopt;
+                return nullptr;
             }
-            return strings_.Intern(names_stream.GetFilename(it->second));
+            return names_stream.GetFilename(it->second);
         };
 
         if (!module.HasLineStream()) {
@@ -244,8 +242,8 @@ void Resolver::ProcessModules(
 
             const PDB::ModuleLineStream module_line_stream = module.CreateLineStream(*raw_file_);
 
-            const std::size_t module_filenames_start = filenames.size();
             std::vector<PendingInlineeSource> pending_inlinee_sources;
+            bool has_filenames_or_inlinee_sources = false;
 
             module_line_stream.ForEachSection(
                 [&](const PDB::CodeView::DBI::LineSection* section) {
@@ -274,8 +272,7 @@ void Resolver::ProcessModules(
                                     return;
                                 }
 
-                                const std::size_t filename_index = filenames.size();
-                                filenames.push_back({ lines_block_header->fileChecksumOffset, 0 });
+                                has_filenames_or_inlinee_sources = true;
 
                                 const std::uint16_t section_index = section->linesHeader.sectionIndex;
                                 const std::uint32_t section_base_offset = section->linesHeader.sectionOffset;
@@ -290,6 +287,7 @@ void Resolver::ProcessModules(
                                     const std::uint32_t section_offset = section_base_offset + current.offset;
                                     const std::uint32_t rva = image_sections_.ConvertSectionOffsetToRVA(section_index, section_offset);
 
+                                    const std::size_t line_index = lines_.size();
                                     lines_.push_back({
                                         rva,
                                         code_size,
@@ -297,9 +295,9 @@ void Resolver::ProcessModules(
                                         current.linenumStart,
                                         current.linenumStart + current.deltaLineEnd,
                                         section_index,
-                                        0,
+                                        nullptr,
                                     });
-                                    pending_file_indices_.push_back(filename_index);
+                                    pending_line_files.push_back({ line_index, lines_block_header->fileChecksumOffset });
                                 }
                             });
                         return;
@@ -308,6 +306,8 @@ void Resolver::ProcessModules(
                     if (section->header.kind != PDB::CodeView::DBI::DebugSubsectionKind::S_INLINEELINES) {
                         return;
                     }
+
+                    has_filenames_or_inlinee_sources = true;
 
                     if (section->inlineeHeader.kind == PDB::CodeView::DBI::InlineeSourceLineKind::Signature) {
                         module_line_stream.ForEachInlineeSourceLine(
@@ -333,31 +333,30 @@ void Resolver::ProcessModules(
                         });
                 });
 
-            if ((module_filenames_start != filenames.size() || !pending_inlinee_sources.empty()) &&
-                module_filename_offset_by_checksum_offset.empty()) {
+            if (has_filenames_or_inlinee_sources && module_filename_offset_by_checksum_offset.empty()) {
                 error = "module line data is missing file checksum records";
                 return;
             }
 
-            for (std::size_t i = module_filenames_start; i < filenames.size(); ++i) {
-                PendingFilename& filename = filenames[i];
-                const auto it = module_filename_offset_by_checksum_offset.find(filename.file_checksum_offset);
+            for (const auto& plf : pending_line_files) {
+                const auto it = module_filename_offset_by_checksum_offset.find(plf.file_checksum_offset);
                 if (it == module_filename_offset_by_checksum_offset.end()) {
                     error = "module line data contains invalid file checksum offset";
                     return;
                 }
-                filename.names_filename_offset = it->second;
+                lines_[plf.line_index].source_file = names_stream.GetFilename(it->second);
             }
+            pending_line_files.clear();
 
             for (const PendingInlineeSource& pending_inlinee : pending_inlinee_sources) {
                 InlineeSourceInfo& source = module_inlinee_sources[pending_inlinee.inlinee_id];
-                if (source.has_source) {
+                if (source.source_file != nullptr) {
                     continue;
                 }
-                if (const std::optional<std::uint32_t> source_index = resolve_module_source_index(pending_inlinee.file_checksum_offset)) {
-                    source.source_index = *source_index;
+                const char* source_file = resolve_module_source_index(pending_inlinee.file_checksum_offset);
+                if (source_file != nullptr) {
+                    source.source_file = source_file;
                     source.line_start = pending_inlinee.line_start;
-                    source.has_source = true;
                 }
             }
         }
@@ -375,12 +374,7 @@ void Resolver::ProcessModules(
                             return;
                         }
 
-                        const std::uint32_t name_index = strings_.Intern(name);
-                        StoreFunction(
-                            function_index_by_rva,
-                            rva,
-                            code_size,
-                            name_index);
+                        StoreFunction(function_index_by_rva, rva, code_size, name);
 
                         current_function_rva = rva;
                         scope_stack.push_back({ ScopeKind::Function, 0 });
@@ -415,7 +409,6 @@ void Resolver::ProcessModules(
                             return;
                         }
 
-                        const auto inlinee_name_it = inlinee_name_index_by_id_.find(record->data.S_INLINESITE.inlinee);
                         InlineeSourceInfo base_source;
                         if (const auto source_it = module_inlinee_sources.find(record->data.S_INLINESITE.inlinee);
                             source_it != module_inlinee_sources.end()) {
@@ -432,10 +425,7 @@ void Resolver::ProcessModules(
                         InlineSiteEntry site;
                         site.function_rva = current_function_rva;
                         site.inlinee_id = record->data.S_INLINESITE.inlinee;
-                        if (inlinee_name_it != inlinee_name_index_by_id_.end()) {
-                            site.name_index = inlinee_name_it->second;
-                            site.name_resolved = true;
-                        }
+                        site.name = ResolveInlineeNameIndex(site.inlinee_id);
                         site.base_source = base_source;
                         site.ranges = BuildInlineRanges(
                             reinterpret_cast<const std::uint8_t*>(record->data.S_INLINESITE.binaryAnnotations),
@@ -484,13 +474,6 @@ void Resolver::ProcessModules(
                 });
         }
     }
-
-    for (std::size_t i = 0; i < pending_file_indices_.size(); ++i) {
-        const PendingFilename& filename = filenames[pending_file_indices_[i]];
-        lines_[new_lines_start + i].source_index =
-            strings_.Intern(names_stream.GetFilename(filename.names_filename_offset));
-    }
-    pending_file_indices_.clear();
 
     std::sort(lines_.begin(), lines_.end(), [](const LineEntry& lhs, const LineEntry& rhs) {
         if (lhs.rva != rhs.rva) {
@@ -547,10 +530,9 @@ void Resolver::LoadPublicSymbols() {
             continue;
         }
 
-        // Reuse existing function index map or build new
         auto [it, inserted] = function_index_by_rva.emplace(rva, functions_.size());
         if (inserted) {
-            functions_.push_back({ rva, 0, strings_.Intern(record->data.S_PUB32.name) });
+            functions_.push_back({ rva, 0, record->data.S_PUB32.name });
         }
     }
 
@@ -614,19 +596,19 @@ void Resolver::BuildTpiRecordOffsets() {
         });
 }
 
-std::optional<std::uint32_t> Resolver::ResolveClassTypeNameIndex(std::uint32_t type_index) {
-    if (const auto it = class_type_name_index_by_id_.find(type_index); it != class_type_name_index_by_id_.end()) {
+const char* Resolver::ResolveClassTypeNameIndex(std::uint32_t type_index) {
+    if (const auto it = class_type_name_by_id_.find(type_index); it != class_type_name_by_id_.end()) {
         return it->second;
     }
     if (missing_class_type_ids_.count(type_index) != 0 || !EnsureTpiStream()) {
-        return std::nullopt;
+        return nullptr;
     }
 
     const std::uint32_t first_type_index = tpi_stream_->GetFirstTypeIndex();
     const std::uint32_t last_type_index = tpi_stream_->GetLastTypeIndex();
     if (type_index < first_type_index || type_index >= last_type_index) {
         missing_class_type_ids_.insert(type_index);
-        return std::nullopt;
+        return nullptr;
     }
 
     BuildTpiRecordOffsets();
@@ -662,27 +644,28 @@ std::optional<std::uint32_t> Resolver::ResolveClassTypeNameIndex(std::uint32_t t
 
     if (name == nullptr || name[0] == '\0') {
         missing_class_type_ids_.insert(type_index);
-        return std::nullopt;
+        return nullptr;
     }
 
-    const std::uint32_t name_index = strings_.Intern(name);
-    class_type_name_index_by_id_.emplace(type_index, name_index);
-    return name_index;
+    owned_strings_.emplace_back(name);
+    const char* result = owned_strings_.back().c_str();
+    class_type_name_by_id_.emplace(type_index, result);
+    return result;
 }
 
-std::optional<std::uint32_t> Resolver::ResolveInlineeNameIndex(std::uint32_t inlinee_id) {
-    if (const auto it = inlinee_name_index_by_id_.find(inlinee_id); it != inlinee_name_index_by_id_.end()) {
+const char* Resolver::ResolveInlineeNameIndex(std::uint32_t inlinee_id) {
+    if (const auto it = inlinee_name_by_id_.find(inlinee_id); it != inlinee_name_by_id_.end()) {
         return it->second;
     }
     if (missing_inlinee_ids_.count(inlinee_id) != 0 || !EnsureIpiStream()) {
-        return std::nullopt;
+        return nullptr;
     }
 
     const std::uint32_t first_type_index = ipi_stream_->GetFirstTypeIndex();
     const std::uint32_t last_type_index = ipi_stream_->GetLastTypeIndex();
     if (inlinee_id < first_type_index || inlinee_id >= last_type_index) {
         missing_inlinee_ids_.insert(inlinee_id);
-        return std::nullopt;
+        return nullptr;
     }
 
     const auto ipi_records = ipi_stream_->GetTypeRecords();
@@ -691,21 +674,21 @@ std::optional<std::uint32_t> Resolver::ResolveInlineeNameIndex(std::uint32_t inl
 
     switch (record->header.kind) {
     case PDB::CodeView::IPI::TypeRecordKind::LF_FUNC_ID: {
-        const bool inserted = resolving_inlinee_ids_.insert(inlinee_id).second;
-        if (!inserted) {
-            qualified_name = record->data.LF_FUNC_ID.name;
-            break;
-        }
-
         if (record->data.LF_FUNC_ID.scopeId != 0) {
-            if (const std::optional<std::uint32_t> parent_name_index =
-                ResolveInlineeNameIndex(record->data.LF_FUNC_ID.scopeId)) {
-                qualified_name += GetString(*parent_name_index);
+            const bool inserted = resolving_inlinee_ids_.insert(inlinee_id).second;
+            if (!inserted) {
+                qualified_name = record->data.LF_FUNC_ID.name;
+                break;
+            }
+
+            const char* parent_name = ResolveInlineeNameIndex(record->data.LF_FUNC_ID.scopeId);
+            if (parent_name != nullptr) {
+                qualified_name += parent_name;
                 qualified_name += "::";
             }
+            resolving_inlinee_ids_.erase(inlinee_id);
         }
         qualified_name += record->data.LF_FUNC_ID.name;
-        resolving_inlinee_ids_.erase(inlinee_id);
         break;
     }
 
@@ -716,9 +699,9 @@ std::optional<std::uint32_t> Resolver::ResolveInlineeNameIndex(std::uint32_t inl
             break;
         }
 
-        if (const std::optional<std::uint32_t> class_name_index =
-            ResolveClassTypeNameIndex(record->data.LF_MFUNC_ID.parentTypeIndex)) {
-            qualified_name += GetString(*class_name_index);
+        const char* class_name = ResolveClassTypeNameIndex(record->data.LF_MFUNC_ID.parentTypeIndex);
+        if (class_name != nullptr) {
+            qualified_name += class_name;
             qualified_name += "::";
         }
         qualified_name += record->data.LF_MFUNC_ID.name;
@@ -728,30 +711,29 @@ std::optional<std::uint32_t> Resolver::ResolveInlineeNameIndex(std::uint32_t inl
 
     default:
         missing_inlinee_ids_.insert(inlinee_id);
-        return std::nullopt;
+        return nullptr;
     }
 
     if (qualified_name.empty()) {
         missing_inlinee_ids_.insert(inlinee_id);
-        return std::nullopt;
+        return nullptr;
     }
 
-    const std::uint32_t name_index = strings_.Intern(std::move(qualified_name));
-    inlinee_name_index_by_id_.emplace(inlinee_id, name_index);
-    return name_index;
+    owned_strings_.push_back(std::move(qualified_name));
+    const char* result = owned_strings_.back().c_str();
+    inlinee_name_by_id_.emplace(inlinee_id, result);
+    return result;
 }
 
 void Resolver::ResolveInlineSiteName(InlineSiteEntry& site) {
-    if (site.name_resolved) {
+    if (site.name != nullptr) {
         return;
     }
 
-    if (const std::optional<std::uint32_t> name_index = ResolveInlineeNameIndex(site.inlinee_id)) {
-        site.name_index = *name_index;
-    } else {
-        site.name_index = GetUnknownInlineeNameIndex();
+    site.name = ResolveInlineeNameIndex(site.inlinee_id);
+    if (site.name == nullptr) {
+        site.name = "<unknown-inlinee>";
     }
-    site.name_resolved = true;
 }
 
 bool Resolver::TryLoadPublicFunction(std::uint32_t rva) {
@@ -816,24 +798,16 @@ bool Resolver::TryLoadPublicFunction(std::uint32_t rva) {
             return entry.rva < value;
         });
 
-    const std::uint32_t name_index = strings_.Intern(previous.name);
     if (it == functions_.end() || it->rva != previous.rva) {
-        functions_.insert(it, { previous.rva, code_size, name_index });
+        functions_.insert(it, { previous.rva, code_size, previous.name });
         return true;
     }
 
     if (it->code_size == 0 || static_cast<std::uint64_t>(it->rva) + it->code_size <= rva) {
         it->code_size = code_size;
     }
-    it->name_index = name_index;
+    it->name = previous.name;
     return true;
-}
-
-std::uint32_t Resolver::GetUnknownInlineeNameIndex() {
-    if (unknown_inlinee_name_index_ == kInvalidStringIndex) {
-        unknown_inlinee_name_index_ = strings_.Intern("<unknown-inlinee>");
-    }
-    return unknown_inlinee_name_index_;
 }
 
 bool Resolver::LoadModulesForRva(std::uint32_t rva, std::string& error) {
@@ -995,22 +969,13 @@ std::vector<InlineFrame> Resolver::FindInlineFrames(std::uint32_t rva) {
     return frames;
 }
 
-const std::string& Resolver::GetString(std::uint32_t index) const {
-    return strings_.Get(index);
-}
-
 bool Resolver::TryGetInlineFrame(const InlineSiteEntry& site, std::uint32_t offset_in_function, InlineFrame& frame) {
     for (const InlineRange& range : site.ranges) {
         if (offset_in_function < range.start_offset || offset_in_function >= range.end_offset) {
             continue;
         }
 
-        frame.has_source = range.has_source || site.base_source.has_source;
-        if (range.has_source) {
-            frame.source_index = range.source_index;
-        } else {
-            frame.source_index = site.base_source.source_index;
-        }
+        frame.source_file = range.source_file ? range.source_file : site.base_source.source_file;
 
         const std::int64_t line =
             static_cast<std::int64_t>(site.base_source.line_start) + static_cast<std::int64_t>(range.line_offset);
@@ -1033,7 +998,7 @@ bool Resolver::FindInlineFramesRecursive(
         }
 
         ResolveInlineSiteName(site);
-        frame.name_index = site.name_index;
+        frame.name = site.name;
         frames.push_back(frame);
         if (FindInlineFramesRecursive(site.children, offset_in_function, frames)) {
             return true;
@@ -1048,16 +1013,16 @@ void Resolver::StoreFunction(
     std::unordered_map<std::uint32_t, std::size_t>& function_index_by_rva,
     std::uint32_t rva,
     std::uint32_t code_size,
-    std::uint32_t name_index) {
+    const char* name) {
     const auto [it, inserted] = function_index_by_rva.emplace(rva, functions_.size());
     if (inserted) {
-        functions_.push_back({ rva, code_size, name_index });
+        functions_.push_back({ rva, code_size, name });
         return;
     }
 
     FunctionEntry& existing = functions_[it->second];
     if (existing.code_size == 0 && code_size != 0) {
         existing.code_size = code_size;
-        existing.name_index = name_index;
+        existing.name = name;
     }
 }

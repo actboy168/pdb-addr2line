@@ -33,9 +33,8 @@ std::vector<InlineRange> BuildInlineRanges(
         ranges.push_back({
             *range_start,
             *range_end,
-            current_source.source_index,
+            current_source.source_file,
             *current_line_offset,
-            current_source.has_source
         });
 
         if (next_source) {
@@ -71,12 +70,7 @@ std::vector<InlineRange> BuildInlineRanges(
 
     auto update_file = [&](std::uint32_t file_checksum_offset) {
         InlineeSourceInfo source = base_source;
-        if (const std::optional<std::uint32_t> source_index = resolve_source_index(file_checksum_offset)) {
-            source.source_index = *source_index;
-            source.has_source = true;
-        } else {
-            source.has_source = false;
-        }
+        source.source_file = resolve_source_index(file_checksum_offset);
 
         if (!range_start) {
             current_source = source;

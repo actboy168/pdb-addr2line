@@ -78,20 +78,17 @@ bool ParseCommandLine(int argc, char** argv, CommandLine& command_line, std::str
 }
 
 void PrintFrameLocation(
-    const Resolver& resolver,
-    std::uint32_t name_index,
-    bool has_source,
-    std::uint32_t source_index,
+    const char* name,
+    const char* source_file,
     std::uint32_t line) {
-    std::cout << resolver.GetString(name_index);
-    if (has_source) {
-        std::cout << " at " << resolver.GetString(source_index) << ':' << line;
+    std::cout << name;
+    if (source_file != nullptr) {
+        std::cout << " at " << source_file << ':' << line;
     }
 }
 
 void PrintResult(
     const Query& query,
-    const Resolver& resolver,
     const LineEntry* entry,
     const FunctionEntry* function,
     const std::vector<InlineFrame>& inline_frames) {
@@ -103,32 +100,30 @@ void PrintResult(
                 std::cout << " (inlined by) ";
             }
             first = false;
-            PrintFrameLocation(resolver, it->name_index, it->has_source, it->source_index, it->line);
+            PrintFrameLocation(it->name, it->source_file, it->line);
             std::cout << std::endl;
         }
 
         if (function != nullptr) {
             std::cout << " (inlined by) ";
             PrintFrameLocation(
-                resolver,
-                function->name_index,
-                entry != nullptr,
-                entry != nullptr ? entry->source_index : 0,
-                entry != nullptr ? entry->line_start : 0);
+                function->name,
+                entry ? entry->source_file : nullptr,
+                entry ? entry->line_start : 0);
             std::cout << std::endl;
         }
         return;
     }
 
     if (function != nullptr) {
-        PrintFrameLocation(resolver, function->name_index, entry != nullptr, entry != nullptr ? entry->source_index : 0, entry != nullptr ? entry->line_start : 0);
+        PrintFrameLocation(function->name, entry ? entry->source_file : nullptr, entry ? entry->line_start : 0);
         std::cout << std::endl;
         return;
     }
 
     if (entry != nullptr) {
         std::cout
-            << resolver.GetString(entry->source_index)
+            << entry->source_file
             << ':'
             << entry->line_start;
 
@@ -181,7 +176,6 @@ int main(int argc, char** argv) {
 
         PrintResult(
             *query,
-            resolver,
             resolver.Find(query->rva),
             resolver.FindFunction(query->rva),
             resolver.FindInlineFrames(query->rva));

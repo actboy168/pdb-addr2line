@@ -29,49 +29,40 @@ struct LineEntry {
     std::uint32_t line_start = 0;
     std::uint32_t line_end = 0;
     std::uint16_t section_index = 0;
-    std::uint32_t source_index = 0;
+    const char* source_file = nullptr;
 };
 
 struct FunctionEntry {
     std::uint32_t rva = 0;
     std::uint32_t code_size = 0;
-    std::uint32_t name_index = 0;
+    const char* name = nullptr;
 };
 
 struct InlineeSourceInfo {
-    std::uint32_t source_index = 0;
+    const char* source_file = nullptr;
     std::uint32_t line_start = 0;
-    bool has_source = false;
 };
 
 struct InlineRange {
     std::uint32_t start_offset = 0;
     std::uint32_t end_offset = 0;
-    std::uint32_t source_index = 0;
+    const char* source_file = nullptr;
     int line_offset = 0;
-    bool has_source = false;
 };
 
 struct InlineSiteEntry {
     std::uint32_t function_rva = 0;
     std::uint32_t inlinee_id = 0;
-    std::uint32_t name_index = 0;
+    const char* name = nullptr;
     InlineeSourceInfo base_source;
     std::vector<InlineRange> ranges;
     std::vector<std::size_t> children;
-    bool name_resolved = false;
 };
 
 struct InlineFrame {
-    std::uint32_t name_index = 0;
-    std::uint32_t source_index = 0;
+    const char* name = nullptr;
+    const char* source_file = nullptr;
     std::uint32_t line = 0;
-    bool has_source = false;
-};
-
-struct PendingFilename {
-    std::uint32_t file_checksum_offset = 0;
-    std::uint32_t names_filename_offset = 0;
 };
 
 enum class ScopeKind {
