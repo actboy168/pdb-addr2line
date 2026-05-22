@@ -2,6 +2,8 @@
 #include "binary_annotations.h"
 #include "pe_utils.h"
 #include "utils.h"
+#include "hash_set8.hpp"
+#include "hash_table8.hpp"
 
 #include "Foundation/PDB_PointerUtil.h"
 #include "PDB.h"
@@ -175,6 +177,28 @@ bool Resolver::Load(const std::string& pdb_path, std::string& error) {
             contribution_rvas_.push_back({ rva, sc.size });
             contribution_modules_.push_back(sc.moduleIndex);
         }
+
+        // Sort by RVA for binary search
+        std::vector<std::size_t> order(contribution_rvas_.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+            return contribution_rvas_[a].first < contribution_rvas_[b].first;
+        });
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> sorted_rvas(contribution_rvas_.size());
+        std::vector<std::uint16_t> sorted_modules(contribution_modules_.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            sorted_rvas[i] = contribution_rvas_[order[i]];
+            sorted_modules[i] = contribution_modules_[order[i]];
+        }
+        contribution_rvas_ = std::move(sorted_rvas);
+        contribution_modules_ = std::move(sorted_modules);
+
+        lines_.reserve(contribution_rvas_.size() * 100);
+        functions_.reserve(contribution_rvas_.size() * 10);
+        inline_sites_.reserve(contribution_rvas_.size() * 10);
     }
 
     return true;
@@ -182,11 +206,19 @@ bool Resolver::Load(const std::string& pdb_path, std::string& error) {
 
 std::vector<std::uint32_t> Resolver::FindModuleIndicesForRva(std::uint32_t rva) const {
     std::vector<std::uint32_t> result;
-    for (std::size_t i = 0; i < contribution_rvas_.size(); ++i) {
-        const std::uint32_t start = contribution_rvas_[i].first;
-        const std::uint32_t end = start + contribution_rvas_[i].second;
-        if (rva >= start && rva < end) {
-            result.push_back(contribution_modules_[i]);
+    if (contribution_rvas_.empty()) {
+        return result;
+    }
+
+    auto it = std::upper_bound(
+        contribution_rvas_.begin(), contribution_rvas_.end(), rva,
+        [](std::uint32_t value, const std::pair<std::uint32_t, std::uint32_t>& contrib) {
+            return value < contrib.first;
+        });
+
+    for (auto check = contribution_rvas_.begin(); check != it; ++check) {
+        if (rva < check->first + check->second) {
+            result.push_back(contribution_modules_[check - contribution_rvas_.begin()]);
         }
     }
     return result;
@@ -195,14 +227,38 @@ std::vector<std::uint32_t> Resolver::FindModuleIndicesForRva(std::uint32_t rva) 
 void Resolver::ProcessModules(
     const PDB::ModuleInfoStream& module_info_stream,
     const PDB::NamesStream& names_stream,
-    const std::unordered_set<std::uint32_t>* module_filter,
+    const ModuleFilter* module_filter,
     std::string& error) {
     struct PendingLineFile {
         std::size_t line_index = 0;
         std::uint32_t file_checksum_offset = 0;
     };
+    struct PendingInlineeSource {
+        std::uint32_t inlinee_id = 0;
+        std::uint32_t file_checksum_offset = 0;
+        std::uint32_t line_start = 0;
+    };
 
-    std::unordered_map<std::uint32_t, std::size_t> function_index_by_rva;
+    const std::size_t old_line_count = lines_.size();
+    const std::size_t old_function_count = functions_.size();
+
+    const auto covers_target = [this](std::uint32_t range_start, std::uint32_t range_size) {
+        const std::uint32_t end = range_start + std::max<std::uint32_t>(range_size, 1u);
+        auto it = std::lower_bound(target_rvas_.begin(), target_rvas_.end(), range_start);
+        return it != target_rvas_.end() && *it < end;
+    };
+
+    const auto mark_resolved = [&](std::uint32_t func_rva, std::uint32_t func_size) {
+        const std::uint32_t func_end = func_rva + std::max<std::uint32_t>(func_size, 1u);
+        for (int i = static_cast<int>(target_rvas_.size()) - 1; i >= 0; --i) {
+            const std::uint32_t rva = target_rvas_[i];
+            if (rva >= func_rva && rva < func_end) {
+                target_rvas_.erase(target_rvas_.begin() + i);
+            }
+        }
+    };
+
+    FunctionIndexMap function_index_by_rva;
     std::vector<PendingLineFile> pending_line_files;
 
     std::vector<std::uint32_t> modules_to_process;
@@ -216,11 +272,16 @@ void Resolver::ProcessModules(
         }
     }
 
+    InlineeSourceMap module_inlinee_sources;
+    ChecksumOffsetMap module_filename_offset_by_checksum_offset;
+    std::vector<PendingInlineeSource> pending_inlinee_sources;
+
     for (std::uint32_t module_index : modules_to_process) {
         const PDB::ModuleInfoStream::Module& module = module_info_stream.GetModule(module_index);
 
-        std::unordered_map<std::uint32_t, InlineeSourceInfo> module_inlinee_sources;
-        std::unordered_map<std::uint32_t, std::uint32_t> module_filename_offset_by_checksum_offset;
+        module_inlinee_sources.clear();
+        module_filename_offset_by_checksum_offset.clear();
+        pending_inlinee_sources.clear();
         const auto resolve_module_source_index = [&](std::uint32_t file_checksum_offset) -> const char* {
             const auto it = module_filename_offset_by_checksum_offset.find(file_checksum_offset);
             if (it == module_filename_offset_by_checksum_offset.end()) {
@@ -234,15 +295,8 @@ void Resolver::ProcessModules(
                 continue;
             }
         } else {
-            struct PendingInlineeSource {
-                std::uint32_t inlinee_id = 0;
-                std::uint32_t file_checksum_offset = 0;
-                std::uint32_t line_start = 0;
-            };
-
             const PDB::ModuleLineStream module_line_stream = module.CreateLineStream(*raw_file_);
 
-            std::vector<PendingInlineeSource> pending_inlinee_sources;
             bool has_filenames_or_inlinee_sources = false;
 
             module_line_stream.ForEachSection(
@@ -263,6 +317,13 @@ void Resolver::ProcessModules(
                     }
 
                     if (section->header.kind == PDB::CodeView::DBI::DebugSubsectionKind::S_LINES) {
+                        const std::uint16_t lines_section_index = section->linesHeader.sectionIndex;
+                        const std::uint32_t lines_section_base = section->linesHeader.sectionOffset;
+                        const std::uint32_t section_rva = image_sections_.ConvertSectionOffsetToRVA(lines_section_index, lines_section_base);
+                        if (!covers_target(section_rva, section->linesHeader.codeSize)) {
+                            return;
+                        }
+
                         module_line_stream.ForEachLinesBlock(
                             section,
                             [&](const PDB::CodeView::DBI::LinesFileBlockHeader* lines_block_header,
@@ -274,8 +335,8 @@ void Resolver::ProcessModules(
 
                                 has_filenames_or_inlinee_sources = true;
 
-                                const std::uint16_t section_index = section->linesHeader.sectionIndex;
-                                const std::uint32_t section_base_offset = section->linesHeader.sectionOffset;
+                                const std::uint16_t section_index = lines_section_index;
+                                const std::uint32_t section_base_offset = lines_section_base;
 
                                 for (std::uint32_t i = 0; i < lines_block_header->numLines; ++i) {
                                     const PDB::CodeView::DBI::Line& current = block_lines[i];
@@ -286,6 +347,10 @@ void Resolver::ProcessModules(
 
                                     const std::uint32_t section_offset = section_base_offset + current.offset;
                                     const std::uint32_t rva = image_sections_.ConvertSectionOffsetToRVA(section_index, section_offset);
+
+                                    if (!covers_target(rva, code_size)) {
+                                        continue;
+                                    }
 
                                     const std::size_t line_index = lines_.size();
                                     lines_.push_back({
@@ -365,6 +430,7 @@ void Resolver::ProcessModules(
             const PDB::ModuleSymbolStream module_symbol_stream = module.CreateSymbolStream(*raw_file_);
             std::vector<ScopeEntry> scope_stack;
             std::uint32_t current_function_rva = 0;
+            bool current_function_covers_target = false;
 
             module_symbol_stream.ForEachSymbol(
                 [&](const PDB::CodeView::DBI::Record* record) {
@@ -374,7 +440,11 @@ void Resolver::ProcessModules(
                             return;
                         }
 
-                        StoreFunction(function_index_by_rva, rva, code_size, name);
+                        current_function_covers_target = covers_target(rva, code_size);
+                        if (current_function_covers_target) {
+                            StoreFunction(function_index_by_rva, rva, code_size, name);
+                            mark_resolved(rva, code_size);
+                        }
 
                         current_function_rva = rva;
                         scope_stack.push_back({ ScopeKind::Function, 0 });
@@ -405,7 +475,7 @@ void Resolver::ProcessModules(
                         return;
 
                     case PDB::CodeView::DBI::SymbolRecordKind::S_INLINESITE: {
-                        if (current_function_rva == 0) {
+                        if (!current_function_covers_target) {
                             return;
                         }
 
@@ -425,7 +495,7 @@ void Resolver::ProcessModules(
                         InlineSiteEntry site;
                         site.function_rva = current_function_rva;
                         site.inlinee_id = record->data.S_INLINESITE.inlinee;
-                        site.name = ResolveInlineeNameIndex(site.inlinee_id);
+                        site.name = nullptr;  // resolved lazily in FindInlineFramesRecursive
                         site.base_source = base_source;
                         site.ranges = BuildInlineRanges(
                             reinterpret_cast<const std::uint8_t*>(record->data.S_INLINESITE.binaryAnnotations),
@@ -464,6 +534,7 @@ void Resolver::ProcessModules(
 
                         if (scope_stack.back().kind == ScopeKind::Function) {
                             current_function_rva = 0;
+                            current_function_covers_target = false;
                         }
                         scope_stack.pop_back();
                         return;
@@ -473,9 +544,13 @@ void Resolver::ProcessModules(
                     }
                 });
         }
+
+        if (target_rvas_.empty()) {
+            break;
+        }
     }
 
-    std::sort(lines_.begin(), lines_.end(), [](const LineEntry& lhs, const LineEntry& rhs) {
+    auto line_cmp = [](const LineEntry& lhs, const LineEntry& rhs) {
         if (lhs.rva != rhs.rva) {
             return lhs.rva < rhs.rva;
         }
@@ -483,10 +558,25 @@ void Resolver::ProcessModules(
             return lhs.section_index < rhs.section_index;
         }
         return lhs.section_offset < rhs.section_offset;
-    });
-    std::sort(functions_.begin(), functions_.end(), [](const FunctionEntry& lhs, const FunctionEntry& rhs) {
+    };
+    auto func_cmp = [](const FunctionEntry& lhs, const FunctionEntry& rhs) {
         return lhs.rva < rhs.rva;
-    });
+    };
+
+    if (lines_.size() > old_line_count) {
+        auto line_mid = lines_.begin() + old_line_count;
+        std::sort(line_mid, lines_.end(), line_cmp);
+        if (old_line_count > 0) {
+            std::inplace_merge(lines_.begin(), line_mid, lines_.end(), line_cmp);
+        }
+    }
+    if (functions_.size() > old_function_count) {
+        auto func_mid = functions_.begin() + old_function_count;
+        std::sort(func_mid, functions_.end(), func_cmp);
+        if (old_function_count > 0) {
+            std::inplace_merge(functions_.begin(), func_mid, functions_.end(), func_cmp);
+        }
+    }
     for (std::size_t i = 0; i + 1 < functions_.size(); ++i) {
         FunctionEntry& current = functions_[i];
         if (current.code_size != 0) {
@@ -511,7 +601,8 @@ void Resolver::LoadPublicSymbols() {
         return;
     }
 
-    std::unordered_map<std::uint32_t, std::size_t> function_index_by_rva;
+    FunctionIndexMap function_index_by_rva;
+    const std::size_t old_func_count = functions_.size();
     const auto symbol_record_stream = dbi_stream_->CreateSymbolRecordStream(*raw_file_);
     const auto public_symbol_stream = dbi_stream_->CreatePublicSymbolStream(*raw_file_);
     for (const PDB::HashRecord& hash_record : public_symbol_stream.GetRecords()) {
@@ -530,25 +621,35 @@ void Resolver::LoadPublicSymbols() {
             continue;
         }
 
+        if (!std::binary_search(target_rvas_.begin(), target_rvas_.end(), rva)) {
+            continue;
+        }
+
         auto [it, inserted] = function_index_by_rva.emplace(rva, functions_.size());
         if (inserted) {
             functions_.push_back({ rva, 0, record->data.S_PUB32.name });
         }
     }
 
-    if (!functions_.empty()) {
-        std::sort(functions_.begin(), functions_.end(), [](const FunctionEntry& lhs, const FunctionEntry& rhs) {
+    if (functions_.size() > old_func_count) {
+        auto func_mid = functions_.begin() + old_func_count;
+        std::sort(func_mid, functions_.end(), [](const FunctionEntry& lhs, const FunctionEntry& rhs) {
             return lhs.rva < rhs.rva;
         });
-        for (std::size_t i = 0; i + 1 < functions_.size(); ++i) {
-            FunctionEntry& current = functions_[i];
-            if (current.code_size != 0) {
-                continue;
-            }
-            const FunctionEntry& next = functions_[i + 1];
-            if (next.rva > current.rva) {
-                current.code_size = next.rva - current.rva;
-            }
+        if (old_func_count > 0) {
+            std::inplace_merge(functions_.begin(), func_mid, functions_.end(), [](const FunctionEntry& lhs, const FunctionEntry& rhs) {
+                return lhs.rva < rhs.rva;
+            });
+        }
+    }
+    for (std::size_t i = 0; i + 1 < functions_.size(); ++i) {
+        FunctionEntry& current = functions_[i];
+        if (current.code_size != 0) {
+            continue;
+        }
+        const FunctionEntry& next = functions_[i + 1];
+        if (next.rva > current.rva) {
+            current.code_size = next.rva - current.rva;
         }
     }
 }
@@ -615,11 +716,13 @@ const char* Resolver::ResolveClassTypeNameIndex(std::uint32_t type_index) {
     const std::size_t offset = tpi_record_offsets_[type_index - first_type_index];
     const PDB::CodeView::TPI::RecordHeader header = tpi_stream_->ReadTypeRecordHeader(offset);
     const std::size_t total_size = sizeof(std::uint16_t) + header.size;
-    std::vector<std::uint8_t> record_bytes(total_size);
+    std::uint8_t stack_buf[512];
+    std::vector<std::uint8_t> heap_buf;
+    std::uint8_t* buf = total_size <= sizeof(stack_buf) ? stack_buf : (heap_buf.resize(total_size), heap_buf.data());
     const PDB::DirectMSFStream& tpi_data = tpi_stream_->GetDirectMSFStream();
-    tpi_data.ReadAtOffset(record_bytes.data(), total_size, offset);
+    tpi_data.ReadAtOffset(buf, total_size, offset);
 
-    const auto* record = reinterpret_cast<const PDB::CodeView::TPI::Record*>(record_bytes.data());
+    const auto* record = reinterpret_cast<const PDB::CodeView::TPI::Record*>(buf);
     const char* name = nullptr;
     switch (header.kind) {
     case PDB::CodeView::TPI::TypeRecordKind::LF_CLASS:
@@ -736,83 +839,9 @@ void Resolver::ResolveInlineSiteName(InlineSiteEntry& site) {
     }
 }
 
-bool Resolver::TryLoadPublicFunction(std::uint32_t rva) {
-    if (!has_public_symbol_stream_) {
-        return false;
-    }
-    if (dbi_stream_->HasValidSymbolRecordStream(*raw_file_) != PDB::ErrorCode::Success) {
-        return false;
-    }
-
-    struct Candidate {
-        const char* name = nullptr;
-        std::uint32_t rva = 0;
-        bool found = false;
-    };
-
-    const auto symbol_record_stream = dbi_stream_->CreateSymbolRecordStream(*raw_file_);
-    const auto public_symbol_stream = dbi_stream_->CreatePublicSymbolStream(*raw_file_);
-    Candidate previous;
-    std::uint32_t next_rva = 0;
-    bool has_next = false;
-    for (const PDB::HashRecord& hash_record : public_symbol_stream.GetRecords()) {
-        const PDB::CodeView::DBI::Record* record = public_symbol_stream.GetRecord(symbol_record_stream, hash_record);
-        if (record->header.kind != PDB::CodeView::DBI::SymbolRecordKind::S_PUB32) {
-            continue;
-        }
-        if ((PDB_AS_UNDERLYING(record->data.S_PUB32.flags) &
-            PDB_AS_UNDERLYING(PDB::CodeView::DBI::PublicSymbolFlags::Function)) == 0u) {
-            continue;
-        }
-
-        const std::uint32_t symbol_rva =
-            image_sections_.ConvertSectionOffsetToRVA(record->data.S_PUB32.section, record->data.S_PUB32.offset);
-        if (symbol_rva == 0) {
-            continue;
-        }
-
-        if (symbol_rva <= rva) {
-            if (!previous.found || symbol_rva > previous.rva) {
-                previous.name = record->data.S_PUB32.name;
-                previous.rva = symbol_rva;
-                previous.found = true;
-            }
-            continue;
-        }
-
-        if (!has_next || symbol_rva < next_rva) {
-            next_rva = symbol_rva;
-            has_next = true;
-        }
-    }
-
-    if (!previous.found) {
-        return false;
-    }
-
-    const std::uint32_t code_size =
-        (has_next && next_rva > previous.rva) ? (next_rva - previous.rva) : (rva - previous.rva + 1u);
-    auto it = std::lower_bound(
-        functions_.begin(), functions_.end(), previous.rva,
-        [](const FunctionEntry& entry, std::uint32_t value) {
-            return entry.rva < value;
-        });
-
-    if (it == functions_.end() || it->rva != previous.rva) {
-        functions_.insert(it, { previous.rva, code_size, previous.name });
-        return true;
-    }
-
-    if (it->code_size == 0 || static_cast<std::uint64_t>(it->rva) + it->code_size <= rva) {
-        it->code_size = code_size;
-    }
-    it->name = previous.name;
-    return true;
-}
-
-bool Resolver::LoadModulesForRva(std::uint32_t rva, std::string& error) {
+const FunctionEntry* Resolver::LoadModulesForRva(std::uint32_t rva, std::string& error) {
     if (all_modules_loaded_) {
-        return true;
+        return FindFunction(rva);
     }
 
     std::vector<std::uint32_t> module_indices = FindModuleIndicesForRva(rva);
@@ -829,7 +858,7 @@ bool Resolver::LoadModulesForRva(std::uint32_t rva, std::string& error) {
             ProcessModules(module_info_stream_, names_stream_, nullptr, error);
         }
     } else if (!module_indices.empty()) {
-        std::unordered_set<std::uint32_t> filter(module_indices.begin(), module_indices.end());
+        ModuleFilter filter(module_indices.begin(), module_indices.end());
         ProcessModules(module_info_stream_, names_stream_, &filter, error);
         for (std::uint32_t idx : module_indices) {
             loaded_module_indices_.insert(idx);
@@ -838,25 +867,19 @@ bool Resolver::LoadModulesForRva(std::uint32_t rva, std::string& error) {
 
     const FunctionEntry* function = FindFunction(rva);
     if (function == nullptr && !public_symbols_loaded_) {
-        if (TryLoadPublicFunction(rva)) {
-            function = FindFunction(rva);
-        } else {
-            LoadPublicSymbols();
-            function = FindFunction(rva);
-        }
+        LoadPublicSymbols();
+        function = FindFunction(rva);
     }
 
-    return error.empty();
+    return function;
 }
 
-std::optional<Query> Resolver::MakeQuery(
+std::optional<std::uint32_t> Resolver::MakeQuery(
     QueryKind kind,
     const std::string& value,
     MemoryMappedFile* image_file,
     std::uint64_t image_base_override,
     std::string& error) const {
-    Query query;
-    query.original = value;
 
     switch (kind) {
     case QueryKind::Rva: {
@@ -869,8 +892,7 @@ std::optional<Query> Resolver::MakeQuery(
             error = "RVA is out of range: " + value;
             return std::nullopt;
         }
-        query.rva = static_cast<std::uint32_t>(parsed);
-        return query;
+        return static_cast<std::uint32_t>(parsed);
     }
 
     case QueryKind::Va: {
@@ -904,8 +926,7 @@ std::optional<Query> Resolver::MakeQuery(
             return std::nullopt;
         }
 
-        query.rva = static_cast<std::uint32_t>(rva64);
-        return query;
+        return static_cast<std::uint32_t>(rva64);
     }
     }
 
@@ -952,8 +973,7 @@ const FunctionEntry* Resolver::FindFunction(std::uint32_t rva) const {
     return nullptr;
 }
 
-std::vector<InlineFrame> Resolver::FindInlineFrames(std::uint32_t rva) {
-    const FunctionEntry* function = FindFunction(rva);
+std::vector<InlineFrame> Resolver::FindInlineFrames(const FunctionEntry* function, std::uint32_t rva) {
     if (function == nullptr) {
         return {};
     }
@@ -1010,7 +1030,7 @@ bool Resolver::FindInlineFramesRecursive(
 }
 
 void Resolver::StoreFunction(
-    std::unordered_map<std::uint32_t, std::size_t>& function_index_by_rva,
+    FunctionIndexMap& function_index_by_rva,
     std::uint32_t rva,
     std::uint32_t code_size,
     const char* name) {

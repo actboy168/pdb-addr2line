@@ -17,11 +17,6 @@ struct CommandLine {
     std::vector<std::string> query_values;
 };
 
-struct Query {
-    std::string original;
-    std::uint32_t rva = 0;
-};
-
 struct LineEntry {
     std::uint32_t rva = 0;
     std::uint32_t code_size = 0;

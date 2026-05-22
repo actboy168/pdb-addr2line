@@ -1,3 +1,6 @@
 [submodule "third_party/raw_pdb"]
 	path = third_party/raw_pdb
 	url = https://github.com/MolecularMatters/raw_pdb.git
+[submodule "third_party/emhash"]
+	path = third_party/emhash
+	url = https://github.com/ktprime/emhash.git

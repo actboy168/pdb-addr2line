@@ -16,6 +16,7 @@ lm:exe "pdb-addr2line" {
     includes = {
         "src",
         "third_party/raw_pdb/src",
+        "third_party/emhash",
     },
     sources =  "src/*.cpp",
 }

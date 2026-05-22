@@ -88,7 +88,7 @@ void PrintFrameLocation(
 }
 
 void PrintResult(
-    const Query& query,
+    const std::string& original,
     const LineEntry* entry,
     const FunctionEntry* function,
     const std::vector<InlineFrame>& inline_frames) {
@@ -135,7 +135,7 @@ void PrintResult(
         return;
     }
 
-    std::cout << query.original << " -> <not found>" << std::endl;
+    std::cout << original << " -> <not found>" << std::endl;
 }
 
 }  // namespace
@@ -160,25 +160,43 @@ int main(int argc, char** argv) {
         return 3;
     }
 
+    struct ResolvedQuery {
+        std::string original;
+        std::uint32_t rva = 0;
+    };
+    std::vector<ResolvedQuery> queries;
+    queries.reserve(command_line.query_values.size());
     for (const std::string& value : command_line.query_values) {
         error.clear();
-        const std::optional<Query> query =
+        std::optional<std::uint32_t> rva =
             resolver.MakeQuery(command_line.query_kind, value, image_file.IsOpen() ? &image_file : nullptr, command_line.image_base_override, error);
-        if (!query) {
+        if (!rva) {
             std::cerr << error << '\n';
             return 4;
         }
+        queries.push_back({ value, *rva });
+    }
 
-        if (!resolver.LoadModulesForRva(query->rva, error)) {
+    std::vector<std::uint32_t> target_rvas;
+    target_rvas.reserve(queries.size());
+    for (const auto& q : queries) {
+        target_rvas.push_back(q.rva);
+    }
+    resolver.SetTargetRvas(std::move(target_rvas));
+
+    for (const auto& q : queries) {
+        error.clear();
+        const FunctionEntry* function = resolver.LoadModulesForRva(q.rva, error);
+        if (!error.empty()) {
             std::cerr << error << '\n';
             return 2;
         }
 
         PrintResult(
-            *query,
-            resolver.Find(query->rva),
-            resolver.FindFunction(query->rva),
-            resolver.FindInlineFrames(query->rva));
+            q.original,
+            resolver.Find(q.rva),
+            function,
+            resolver.FindInlineFrames(function, q.rva));
     }
 
     return 0;
