@@ -6,8 +6,6 @@
 #include <optional>
 #include <vector>
 
-bool ReadCompressedAnnotation(const std::uint8_t*& current, const std::uint8_t* end, std::uint32_t& value);
-int DecodeSignedAnnotation(std::uint32_t operand);
 bool ReadDecodedAnnotation(const std::uint8_t*& current, const std::uint8_t* end, DecodedAnnotation& annotation);
 
 template <typename F>

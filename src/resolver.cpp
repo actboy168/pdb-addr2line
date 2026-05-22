@@ -20,9 +20,7 @@
 #include "PDB_Util.h"
 
 #include <algorithm>
-#include <memory>
 #include <string_view>
-#include <unordered_set>
 
 Resolver::Resolver() = default;
 Resolver::~Resolver() = default;
@@ -223,9 +221,6 @@ void Resolver::ProcessModules(
     for (std::uint32_t module_index : modules_to_process) {
         const PDB::ModuleInfoStream::Module& module = module_info_stream.GetModule(module_index);
 
-        const std::uint32_t module_name_index = strings_.Intern(ToStringView(module.GetName()));
-        const std::uint32_t object_name_index = strings_.Intern(ToStringView(module.GetObjectName()));
-
         std::unordered_map<std::uint32_t, InlineeSourceInfo> module_inlinee_sources;
         std::unordered_map<std::uint32_t, std::uint32_t> module_filename_offset_by_checksum_offset;
         const auto resolve_module_source_index = [&](std::uint32_t file_checksum_offset) -> std::optional<std::uint32_t> {
@@ -303,9 +298,6 @@ void Resolver::ProcessModules(
                                         current.linenumStart + current.deltaLineEnd,
                                         section_index,
                                         0,
-                                        module_name_index,
-                                        object_name_index,
-                                        current.fStatement != 0
                                     });
                                     pending_file_indices_.push_back(filename_index);
                                 }
@@ -388,9 +380,7 @@ void Resolver::ProcessModules(
                             function_index_by_rva,
                             rva,
                             code_size,
-                            name_index,
-                            module_name_index,
-                            object_name_index);
+                            name_index);
 
                         current_function_rva = rva;
                         scope_stack.push_back({ ScopeKind::Function, 0 });
@@ -446,8 +436,6 @@ void Resolver::ProcessModules(
                             site.name_index = inlinee_name_it->second;
                             site.name_resolved = true;
                         }
-                        site.module_index = module_name_index;
-                        site.object_index = object_name_index;
                         site.base_source = base_source;
                         site.ranges = BuildInlineRanges(
                             reinterpret_cast<const std::uint8_t*>(record->data.S_INLINESITE.binaryAnnotations),
@@ -562,7 +550,7 @@ void Resolver::LoadPublicSymbols() {
         // Reuse existing function index map or build new
         auto [it, inserted] = function_index_by_rva.emplace(rva, functions_.size());
         if (inserted) {
-            functions_.push_back({ rva, 0, strings_.Intern(record->data.S_PUB32.name), 0, 0 });
+            functions_.push_back({ rva, 0, strings_.Intern(record->data.S_PUB32.name) });
         }
     }
 
@@ -830,7 +818,7 @@ bool Resolver::TryLoadPublicFunction(std::uint32_t rva) {
 
     const std::uint32_t name_index = strings_.Intern(previous.name);
     if (it == functions_.end() || it->rva != previous.rva) {
-        functions_.insert(it, { previous.rva, code_size, name_index, 0, 0 });
+        functions_.insert(it, { previous.rva, code_size, name_index });
         return true;
     }
 
@@ -1060,20 +1048,16 @@ void Resolver::StoreFunction(
     std::unordered_map<std::uint32_t, std::size_t>& function_index_by_rva,
     std::uint32_t rva,
     std::uint32_t code_size,
-    std::uint32_t name_index,
-    std::uint32_t module_index,
-    std::uint32_t object_index) {
+    std::uint32_t name_index) {
     const auto [it, inserted] = function_index_by_rva.emplace(rva, functions_.size());
     if (inserted) {
-        functions_.push_back({ rva, code_size, name_index, module_index, object_index });
+        functions_.push_back({ rva, code_size, name_index });
         return;
     }
 
     FunctionEntry& existing = functions_[it->second];
     if (existing.code_size == 0 && code_size != 0) {
         existing.code_size = code_size;
-        existing.module_index = module_index;
-        existing.object_index = object_index;
         existing.name_index = name_index;
     }
 }

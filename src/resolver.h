@@ -67,9 +67,7 @@ private:
         std::unordered_map<std::uint32_t, std::size_t>& function_index_by_rva,
         std::uint32_t rva,
         std::uint32_t code_size,
-        std::uint32_t name_index,
-        std::uint32_t module_index,
-        std::uint32_t object_index);
+        std::uint32_t name_index);
 
     std::vector<std::uint32_t> FindModuleIndicesForRva(std::uint32_t rva) const;
     bool EnsureIpiStream();

@@ -1,6 +1,6 @@
 #include "binary_annotations.h"
 
-bool ReadCompressedAnnotation(const std::uint8_t*& current, const std::uint8_t* end, std::uint32_t& value) {
+static bool ReadCompressedAnnotation(const std::uint8_t*& current, const std::uint8_t* end, std::uint32_t& value) {
     if (current >= end) {
         return false;
     }
@@ -39,7 +39,7 @@ bool ReadCompressedAnnotation(const std::uint8_t*& current, const std::uint8_t* 
     return false;
 }
 
-int DecodeSignedAnnotation(std::uint32_t operand) {
+static int DecodeSignedAnnotation(std::uint32_t operand) {
     return (operand & 1u) ? -static_cast<int>(operand >> 1) : static_cast<int>(operand >> 1);
 }
 

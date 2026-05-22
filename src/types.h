@@ -30,17 +30,12 @@ struct LineEntry {
     std::uint32_t line_end = 0;
     std::uint16_t section_index = 0;
     std::uint32_t source_index = 0;
-    std::uint32_t module_index = 0;
-    std::uint32_t object_index = 0;
-    bool is_statement = false;
 };
 
 struct FunctionEntry {
     std::uint32_t rva = 0;
     std::uint32_t code_size = 0;
     std::uint32_t name_index = 0;
-    std::uint32_t module_index = 0;
-    std::uint32_t object_index = 0;
 };
 
 struct InlineeSourceInfo {
@@ -61,8 +56,6 @@ struct InlineSiteEntry {
     std::uint32_t function_rva = 0;
     std::uint32_t inlinee_id = 0;
     std::uint32_t name_index = 0;
-    std::uint32_t module_index = 0;
-    std::uint32_t object_index = 0;
     InlineeSourceInfo base_source;
     std::vector<InlineRange> ranges;
     std::vector<std::size_t> children;

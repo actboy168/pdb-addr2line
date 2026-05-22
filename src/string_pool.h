@@ -20,10 +20,6 @@ public:
         return index;
     }
 
-    std::uint32_t Intern(const std::string& value) {
-        return Intern(std::string_view(value));
-    }
-
     std::uint32_t Intern(const char* value) {
         return Intern(std::string_view(value));
     }
