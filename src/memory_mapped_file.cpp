@@ -1,5 +1,7 @@
 #include "memory_mapped_file.h"
 
+#ifdef _WIN32
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -90,3 +92,82 @@ void MemoryMappedFile::Close() {
 
     size_ = 0;
 }
+
+#else  // POSIX
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <utility>
+
+MemoryMappedFile::MemoryMappedFile(MemoryMappedFile&& other) noexcept {
+    *this = std::move(other);
+}
+
+MemoryMappedFile& MemoryMappedFile::operator=(MemoryMappedFile&& other) noexcept {
+    if (this != &other) {
+        Close();
+
+        base_address_ = other.base_address_;
+        size_ = other.size_;
+
+        other.base_address_ = nullptr;
+        other.size_ = 0;
+    }
+
+    return *this;
+}
+
+MemoryMappedFile::~MemoryMappedFile() {
+    Close();
+}
+
+bool MemoryMappedFile::Open(const char* path, std::string& error) {
+    Close();
+
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) {
+        error = "failed to open file";
+        return false;
+    }
+
+    struct stat st;
+    if (::fstat(fd, &st) < 0) {
+        error = "failed to read file information";
+        ::close(fd);
+        return false;
+    }
+
+    size_ = static_cast<std::size_t>(st.st_size);
+
+    if (size_ == 0) {
+        ::close(fd);
+        error.clear();
+        return true;
+    }
+
+    base_address_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+
+    if (base_address_ == MAP_FAILED) {
+        error = "failed to map file into memory";
+        base_address_ = nullptr;
+        size_ = 0;
+        return false;
+    }
+
+    error.clear();
+    return true;
+}
+
+void MemoryMappedFile::Close() {
+    if (base_address_ != nullptr) {
+        ::munmap(base_address_, size_);
+        base_address_ = nullptr;
+    }
+    size_ = 0;
+}
+
+#endif

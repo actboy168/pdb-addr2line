@@ -30,8 +30,10 @@ public:
     }
 
 private:
+#ifdef _WIN32
     void* file_ = nullptr;
     void* mapping_ = nullptr;
+#endif
     void* base_address_ = nullptr;
     std::size_t size_ = 0;
 };

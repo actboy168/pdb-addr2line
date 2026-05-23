@@ -358,7 +358,7 @@ void Resolver::ProcessModules(
                                         code_size,
                                         section_offset,
                                         current.linenumStart,
-                                        current.linenumStart + current.deltaLineEnd,
+                                        static_cast<std::uint32_t>(current.linenumStart + current.deltaLineEnd),
                                         section_index,
                                         nullptr,
                                     });
